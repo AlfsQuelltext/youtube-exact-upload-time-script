@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Exact Upload Time
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Replaces the default upload date in the YouTube description box with the exact publication date and time (down to the minute).
 // @author       AlfsQuelltext
 // @match        *://*.youtube.com/*
@@ -25,7 +25,7 @@
     async function fetchDateFromServer(vid) {
         if (!vid || isFetching) return;
         isFetching = true;
-        exactDateTimeStr = null; // Altes Datum löschen, um falsche Anzeigen zu vermeiden
+        exactDateTimeStr = null;
 
         try {
             const response = await fetch('/watch?v=' + vid);
