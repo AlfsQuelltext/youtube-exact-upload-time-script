@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Exact Upload Time
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Replaces the default upload date in the YouTube description box with the exact publication date and time (down to the minute).
 // @author       AlfsQuelltext
 // @match        *://*.youtube.com/*
@@ -13,106 +13,296 @@
 
 (function() {
     'use strict';
-  
-    let exactDateTimeStr = null;
+
+    const WATCH_SELECTOR = 'ytd-watch-flexy';
+    const INFO_SELECTOR = 'yt-formatted-string#info.ytd-watch-info-text';
+    const EXPANDER_SELECTOR = 'ytd-text-inline-expander';
+    const MAX_CACHE_SIZE = 100;
+    const DATE_PATTERNS = [
+        /"(?:uploadDate|publishDate)":"([^"]+T[^"]+)"/,
+        /<meta itemprop="uploadDate" content="([^"]+T[^"]+)">/
+    ];
+
+    let exactDateTimeIso = null;
     let currentVideoId = null;
-    let isFetching = false;
+    let abortController = null;
+    let observedWatchNode = null;
+    let observedInfoNode = null;
+    let observedExpanderNode = null;
+    let observedDateSpan = null;
+    let watchDomChangeFrameId = 0;
+    const dateCache = new Map();
 
-    let observedNode = null;
+    let cachedFormatter = null;
+    let cachedLang = null;
 
-    const regexDate = /(\d{1,2}[\.\/-]\d{1,2}[\.\/-]\d{2,4})|(\d{1,2}\.?\s*[a-zäöüß]+\s*\d{4})|([a-zäöüß]+\s*\d{1,2},?\s*\d{4})/i;
+    function formatDate(dateObj) {
+        const lang = document.documentElement.lang || navigator.language || 'de-DE';
+        if (lang !== cachedLang) {
+            cachedLang = lang;
+            cachedFormatter = new Intl.DateTimeFormat(lang, {
+                day: '2-digit', month: '2-digit', year: 'numeric',
+                hour: '2-digit', minute: '2-digit'
+            });
+        }
+        const str = cachedFormatter.format(dateObj);
+        return lang.startsWith('de') ? str + ' Uhr' : str;
+    }
 
-    async function fetchDateFromServer(vid) {
-        if (!vid || isFetching) return;
-        isFetching = true;
-        exactDateTimeStr = null;
+    function disconnectNodeObservers() {
+        infoObserver.disconnect();
+        expanderObserver.disconnect();
+        observedInfoNode = null;
+        observedExpanderNode = null;
+        observedDateSpan = null;
+    }
+
+    function resetState() {
+        disconnectNodeObservers();
+        if (watchDomChangeFrameId) {
+            cancelAnimationFrame(watchDomChangeFrameId);
+            watchDomChangeFrameId = 0;
+        }
+        if (abortController) {
+            abortController.abort();
+            abortController = null;
+        }
+        exactDateTimeIso = null;
+        currentVideoId = null;
+    }
+
+    function extractDateString(html) {
+        for (const pattern of DATE_PATTERNS) {
+            const match = html.match(pattern);
+            if (match?.[1]) return match[1];
+        }
+        return null;
+    }
+
+    function tryExtractDateFromDOM(vid) {
+        try {
+            const playerResponse = window.ytInitialPlayerResponse;
+            const playerVideoId = playerResponse?.videoDetails?.videoId;
+            if (playerVideoId !== vid) return null;
+
+            const renderer = playerResponse.microformat?.playerMicroformatRenderer;
+            const date = renderer?.uploadDate || renderer?.publishDate;
+            if (date?.includes('T')) return date;
+        } catch (_) {}
+
+        return null;
+    }
+
+    function tryApplyDateFromDOM(vid) {
+        const domDate = tryExtractDateFromDOM(vid);
+        if (!domDate) return false;
+
+        const normalizedDate = processAndCacheDate(vid, domDate);
+        if (!normalizedDate || vid !== currentVideoId) return false;
+
+        exactDateTimeIso = normalizedDate;
+        updateUI();
+        return true;
+    }
+
+    function processAndCacheDate(vid, dateString) {
+        if (!dateString) return null;
+        const dateObj = new Date(dateString);
+        if (Number.isNaN(dateObj.getTime())) return null;
+        if (dateCache.size >= MAX_CACHE_SIZE) {
+            dateCache.delete(dateCache.keys().next().value);
+        }
+        dateCache.set(vid, dateString);
+        return dateString;
+    }
+
+    function findDateSpan() {
+        const spans = observedInfoNode.querySelectorAll('span.yt-formatted-string');
+        for (let i = spans.length - 1; i >= 0; i--) {
+            const text = spans[i].textContent.trim();
+            if (text.length > 0 && !/^[\s•·|,]+$/.test(text)) return spans[i];
+        }
+        return null;
+    }
+
+    function getDateSpan() {
+        if (!observedInfoNode) return null;
+        if (observedDateSpan && observedInfoNode.contains(observedDateSpan)) {
+            return observedDateSpan;
+        }
+        observedDateSpan = findDateSpan();
+        return observedDateSpan;
+    }
+
+    function isDescriptionExpanded() {
+        const expander = observedExpanderNode || document.querySelector(EXPANDER_SELECTOR);
+        return !expander || expander.hasAttribute('is-expanded');
+    }
+
+    function observeInfoNode(infoNode) {
+        if (infoNode === observedInfoNode) return;
+
+        infoObserver.disconnect();
+        observedInfoNode = infoNode;
+        observedDateSpan = null;
+
+        if (observedInfoNode) {
+            infoObserver.observe(observedInfoNode, { childList: true, subtree: true, characterData: true });
+        }
+    }
+
+    function observeExpanderNode(expanderNode) {
+        if (expanderNode === observedExpanderNode) return;
+
+        expanderObserver.disconnect();
+        observedExpanderNode = expanderNode;
+
+        if (observedExpanderNode) {
+            expanderObserver.observe(observedExpanderNode, { attributes: true, attributeFilter: ['is-expanded'] });
+        }
+    }
+
+    function refreshObservedNodes() {
+        const root = observedWatchNode || document;
+        observeInfoNode(root.querySelector(INFO_SELECTOR));
+        observeExpanderNode(root.querySelector(EXPANDER_SELECTOR));
+    }
+
+    function handleWatchDomChange() {
+        watchDomChangeFrameId = 0;
+        refreshObservedNodes();
+        if (!exactDateTimeIso && currentVideoId) {
+            tryApplyDateFromDOM(currentVideoId);
+        }
+        updateUI();
+    }
+
+    function scheduleWatchDomChange() {
+        if (watchDomChangeFrameId) return;
+        watchDomChangeFrameId = requestAnimationFrame(handleWatchDomChange);
+    }
+
+    function startRootObserver() {
+        if (document.body) {
+            rootObserver.observe(document.body, { childList: true, subtree: true });
+        }
+    }
+
+    function stopRootObserver() {
+        rootObserver.disconnect();
+    }
+
+    function refreshWatchObserver() {
+        const watchNode = document.querySelector(WATCH_SELECTOR);
+        if (watchNode) {
+            stopRootObserver();
+        } else {
+            startRootObserver();
+        }
+        if (watchNode === observedWatchNode) return;
+
+        watchObserver.disconnect();
+        observedWatchNode = watchNode;
+        disconnectNodeObservers();
+
+        if (observedWatchNode) {
+            watchObserver.observe(observedWatchNode, { childList: true, subtree: true });
+        }
+
+        scheduleWatchDomChange();
+    }
+
+    async function fetchDateForVideo(vid) {
+        if (!vid || vid !== currentVideoId) return;
+
+        const cached = dateCache.get(vid);
+        if (cached) {
+            exactDateTimeIso = cached;
+            updateUI();
+            return;
+        }
+
+        if (tryApplyDateFromDOM(vid)) {
+            return;
+        }
+
+        if (abortController) abortController.abort();
+        const controller = new AbortController();
+        abortController = controller;
 
         try {
-            const response = await fetch('/watch?v=' + vid);
+            const response = await fetch('/watch?v=' + encodeURIComponent(vid), { signal: controller.signal });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
             const html = await response.text();
-
-            const match = html.match(/<meta itemprop="uploadDate" content="([^"]+)">/) ||
-                          html.match(/"(?:uploadDate|publishDate)":"([^"]+)"/);
-
-            if (match && match[1]) {
-                const dateObj = new Date(match[1]);
-
-                if (!isNaN(dateObj)) {
-                    const userLang = document.documentElement.lang || navigator.language || 'de-DE';
-
-                    exactDateTimeStr = dateObj.toLocaleString(userLang, {
-                        day: '2-digit',
-                        month: '2-digit',
-                        year: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit'
-                    });
-
-                    if (userLang.startsWith('de')) {
-                        exactDateTimeStr += ' Uhr';
-                    }
-
+            if (vid === currentVideoId) {
+                const normalizedDate = processAndCacheDate(vid, extractDateString(html));
+                if (normalizedDate) {
+                    exactDateTimeIso = normalizedDate;
                     updateUI();
                 }
             }
         } catch (err) {
-            console.error("[YT-TIME] Fehler beim Herunterladen des Datums:", err);
+            if (err.name !== 'AbortError') {
+                console.error('[YT-TIME] Error fetching date:', err);
+            }
+        } finally {
+            if (abortController === controller) abortController = null;
         }
-
-        isFetching = false;
     }
 
     function updateUI() {
-        if (!exactDateTimeStr || !observedNode) return;
+        if (!observedInfoNode) return;
+        const dateSpan = getDateSpan();
+        if (!dateSpan) return;
+        const exactDateTimeStr = exactDateTimeIso ? formatDate(new Date(exactDateTimeIso)) : null;
 
-        const spans = observedNode.querySelectorAll('span.yt-formatted-string');
-
-        for (let span of spans) {
-            const text = span.textContent.trim();
-
-            if (text === exactDateTimeStr) break;
-
-            if (text.length > 0 && regexDate.test(text)) {
-                span.textContent = exactDateTimeStr;
-                span.style.fontWeight = "500";
-                break;
+        if (isDescriptionExpanded() && exactDateTimeStr) {
+            if (dateSpan.textContent.trim() !== exactDateTimeStr) {
+                dateSpan.textContent = exactDateTimeStr;
+                dateSpan.style.fontWeight = '500';
+                dateSpan.dataset.ytTimeApplied = '1';
             }
+        } else if (dateSpan.dataset.ytTimeApplied) {
+            dateSpan.style.fontWeight = '';
+            delete dateSpan.dataset.ytTimeApplied;
         }
     }
 
-    const antiFlickerObserver = new MutationObserver(() => {
-        updateUI();
-    });
+    const infoObserver = new MutationObserver(updateUI);
+    const expanderObserver = new MutationObserver(updateUI);
+    const watchObserver = new MutationObserver(scheduleWatchDomChange);
+    const rootObserver = new MutationObserver(refreshWatchObserver);
 
-    setInterval(() => {
-        if (!window.location.pathname.includes('/watch')) return;
+    function startObservers() {
+        startRootObserver();
+        refreshWatchObserver();
+    }
 
-        const infoContainer = document.querySelector('yt-formatted-string#info.ytd-watch-info-text');
-
-        if (infoContainer && infoContainer !== observedNode) {
-            if (observedNode) antiFlickerObserver.disconnect();
-
-            antiFlickerObserver.observe(infoContainer, { childList: true, subtree: true, characterData: true });
-            observedNode = infoContainer;
-
-            updateUI();
+    function onNavigate() {
+        const vid = new URLSearchParams(window.location.search).get('v');
+        if (!vid) {
+            resetState();
+            return;
         }
-    }, 500);
-
-    window.addEventListener('yt-navigate-finish', () => {
-        const params = new URLSearchParams(window.location.search);
-        const vid = params.get('v');
-
-        if (vid && vid !== currentVideoId) {
+        if (vid !== currentVideoId) {
             currentVideoId = vid;
-            fetchDateFromServer(vid);
+            disconnectNodeObservers();
+            exactDateTimeIso = null;
+            startRootObserver();
+            refreshWatchObserver();
+            fetchDateForVideo(vid);
         }
-    });
+    }
 
-    if (window.location.pathname.includes('/watch')) {
-        const params = new URLSearchParams(window.location.search);
-        currentVideoId = params.get('v');
-        if (currentVideoId) fetchDateFromServer(currentVideoId);
+    window.addEventListener('yt-navigate-finish', onNavigate);
+
+    startObservers();
+
+    if (window.location.pathname === '/watch') {
+        currentVideoId = new URLSearchParams(window.location.search).get('v');
+        if (currentVideoId) {
+            fetchDateForVideo(currentVideoId);
+        }
     }
 
 })();
