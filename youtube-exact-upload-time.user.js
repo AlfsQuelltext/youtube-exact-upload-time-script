@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Exact Upload Time
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Replaces the default upload date in the YouTube description box with the exact publication date and time (down to the minute).
 // @author       AlfsQuelltext
 // @match        *://*.youtube.com/*
@@ -29,7 +29,6 @@
     let observedWatchNode = null;
     let observedInfoNode = null;
     let observedExpanderNode = null;
-    let observedDateSpan = null;
     let watchDomChangeFrameId = 0;
     const dateCache = new Map();
 
@@ -54,7 +53,6 @@
         expanderObserver.disconnect();
         observedInfoNode = null;
         observedExpanderNode = null;
-        observedDateSpan = null;
     }
 
     function resetState() {
@@ -116,22 +114,25 @@
         return dateString;
     }
 
+    function hasFilledViewCountRollingNumber() {
+        const root = observedWatchNode || document;
+        const rollingNumber = root.querySelector('#view-count yt-animated-rolling-number');
+        return !!rollingNumber?.querySelector('animated-rolling-character');
+    }
+
     function findDateSpan() {
-        const spans = observedInfoNode.querySelectorAll('span.yt-formatted-string');
-        for (let i = spans.length - 1; i >= 0; i--) {
-            const text = spans[i].textContent.trim();
-            if (text.length > 0 && !/^[\s•·|,]+$/.test(text)) return spans[i];
-        }
-        return null;
+        const spans = Array.from(observedInfoNode.children).filter((child) => {
+            return child.tagName === 'SPAN' && child.textContent.trim().length > 0;
+        });
+
+        if (spans.length === 0) return null;
+
+        return hasFilledViewCountRollingNumber() ? spans[0] : (spans[1] || spans[0]);
     }
 
     function getDateSpan() {
         if (!observedInfoNode) return null;
-        if (observedDateSpan && observedInfoNode.contains(observedDateSpan)) {
-            return observedDateSpan;
-        }
-        observedDateSpan = findDateSpan();
-        return observedDateSpan;
+        return findDateSpan();
     }
 
     function isDescriptionExpanded() {
@@ -144,7 +145,6 @@
 
         infoObserver.disconnect();
         observedInfoNode = infoNode;
-        observedDateSpan = null;
 
         if (observedInfoNode) {
             infoObserver.observe(observedInfoNode, { childList: true, subtree: true, characterData: true });
